@@ -45,6 +45,7 @@ const PeerSearchResult = struct {
 const SnapshopType = enum {
     Full,
     Incremental,
+    All,
 };
 
 /// finds valid contact infos which we can download a snapshot from.
@@ -184,62 +185,148 @@ pub fn reliablyDownloadSnapshotsFromGossip(
     snapshot_type: SnapshopType,
 ) !void {
     const logger = logger_.withScope(LOG_SCOPE);
-     logger
-         .info()
-         .logf("starting snapshot download with min download speed: {d} MB/s", .{min_mb_per_sec});
-     //
-     // TODO: maybe make this bigger? or dynamic?
-      var contact_info_buf: [1_000]ThreadSafeContactInfo = undefined;
+    logger
+        .info()
+        .logf("starting snapshot download with min download speed: {d} MB/s", .{min_mb_per_sec});
+    //
+    // TODO: maybe make this bigger? or dynamic?
+    var contact_info_buf: [1_000]ThreadSafeContactInfo = undefined;
 
-      const my_contact_info = gossip_service.my_contact_info;
+    const my_contact_info = gossip_service.my_contact_info;
 
-      var available_snapshot_peers = std.ArrayList(PeerSnapshotHash).init(allocator);
-      defer available_snapshot_peers.deinit();
+    var available_snapshot_peers = std.ArrayList(PeerSnapshotHash).init(allocator);
+    defer available_snapshot_peers.deinit();
 
-      var slow_peer_pubkeys = std.ArrayList(Pubkey).init(allocator);
-      defer slow_peer_pubkeys.deinit();
+    var slow_peer_pubkeys = std.ArrayList(Pubkey).init(allocator);
+    defer slow_peer_pubkeys.deinit();
 
-      while (true) {
-          std.time.sleep(std.time.ns_per_s * 5); // wait while gossip table updates
+    while (true) {
+        std.time.sleep(std.time.ns_per_s * 5); // wait while gossip table updates
 
-          // only hold gossip table lock for this block
-          {
-              const gossip_table, var gossip_table_lg = gossip_service.gossip_table_rw.readWithLock();
-              defer gossip_table_lg.unlock();
+        // only hold gossip table lock for this block
+        {
+            const gossip_table, var gossip_table_lg = gossip_service.gossip_table_rw.readWithLock();
+            defer gossip_table_lg.unlock();
 
-              const contacts = gossip_table.getThreadSafeContactInfos(&contact_info_buf, 0);
+            const contacts = gossip_table.getThreadSafeContactInfos(&contact_info_buf, 0);
 
-              try available_snapshot_peers.ensureTotalCapacity(contacts.len);
-              const result = try findPeersToDownloadFromAssumeCapacity(
-                  allocator,
-                  gossip_table,
-                  contacts,
-                  my_contact_info.shred_version,
-                  my_contact_info.pubkey,
-                  slow_peer_pubkeys.items,
-                  maybe_trusted_validators,
-                  // this is cleared and populated
-                  &available_snapshot_peers,
-              );
+            try available_snapshot_peers.ensureTotalCapacity(contacts.len);
+            const result = try findPeersToDownloadFromAssumeCapacity(
+                allocator,
+                gossip_table,
+                contacts,
+                my_contact_info.shred_version,
+                my_contact_info.pubkey,
+                slow_peer_pubkeys.items,
+                maybe_trusted_validators,
+                // this is cleared and populated
+                &available_snapshot_peers,
+            );
 
-              var write_buf: [512]u8 = undefined;
-              var i: usize = 0;
-              inline for (@typeInfo(PeerSearchResult).Struct.fields) |field| {
-                  if (@field(result, field.name) != 0) {
-                      const r = try std.fmt.bufPrint(write_buf[i..], "{s}: {d} ", .{ field.name, @field(result, field.name) });
-                      i += r.len;
-                  }
-              }
-              logger
-                  .info()
-                  .logf("searched for snapshot peers: {s}", .{write_buf[0..i]});
-          }
+            var write_buf: [512]u8 = undefined;
+            var i: usize = 0;
+            inline for (@typeInfo(PeerSearchResult).Struct.fields) |field| {
+                if (@field(result, field.name) != 0) {
+                    const r = try std.fmt.bufPrint(write_buf[i..], "{s}: {d} ", .{ field.name, @field(result, field.name) });
+                    i += r.len;
+                }
+            }
+            logger
+                .info()
+                .logf("searched for snapshot peers: {s}", .{write_buf[0..i]});
+        }
 
-     if (snapshot_type == SnapshopType.Full) {
+        for (available_snapshot_peers.items) |peer| {
+            // download the full snapshot
+            const snapshot_filename_bounded = sig.accounts_db.snapshots.FullSnapshotFileInfo.snapshotArchiveName(.{
+                .slot = peer.full_snapshot.slot,
+                .hash = peer.full_snapshot.hash,
+            });
+            const snapshot_filename = snapshot_filename_bounded.constSlice();
 
-     } else {
+            const rpc_socket = peer.contact_info.rpc_addr.?;
+            const rpc_url_bounded = rpc_socket.toString();
+            const rpc_url = rpc_url_bounded.constSlice();
 
-     }
+            const bStr = sig.utils.fmt.boundedString;
+            const snapshot_url_bounded = sig.utils.fmt.boundedFmt("http://{s}/{s}\x00", .{
+                bStr(&rpc_url_bounded),
+                bStr(&snapshot_filename_bounded),
+            });
+            const snapshot_url = snapshot_url_bounded.constSlice()[0 .. snapshot_url_bounded.len - 1 :0];
+
+            if (snapshot_type == .Full or snapshot_type == .All) { //TODO:ALL
+                logger
+                    .info()
+                    .logf("downloading full_snapshot from: {s}", .{snapshot_url});
+
+                downloadFile(
+                    allocator,
+                    logger,
+                    snapshot_url,
+                    output_dir,
+                    snapshot_filename,
+                    min_mb_per_sec,
+                ) catch |err| {
+                    switch (err) {
+                        // if we hit this error, then the error should have been printed in the
+                        // downloadFile function
+                        error.Unexpected => {},
+                        error.TooSlow => {
+                            logger.info().logf("peer is too slow, skipping", .{});
+                            try slow_peer_pubkeys.append(peer.contact_info.pubkey);
+                        },
+                        else => {
+                            logger.info().logf("failed to download full_snapshot: {s}", .{@errorName(err)});
+                        },
+                    }
+                    continue;
+                };
+            }
+
+            if (snapshot_type == .Incremental or snapshot_type == .All) {
+                // download the incremental snapshot
+                // PERF: maybe do this in another thread? while downloading the full snapshot
+                if (peer.inc_snapshot) |inc_snapshot| {
+                    const inc_snapshot_filename = try std.fmt.allocPrint(allocator, "incremental-snapshot-{d}-{d}-{s}.{s}", .{
+                        peer.full_snapshot.slot,
+                        inc_snapshot.slot,
+                        inc_snapshot.hash,
+                        "tar.zst",
+                    });
+                    defer allocator.free(inc_snapshot_filename);
+
+                    const inc_snapshot_url = try std.fmt.allocPrintZ(allocator, "http://{s}/{s}", .{
+                        rpc_url,
+                        inc_snapshot_filename,
+                    });
+                    defer allocator.free(inc_snapshot_url);
+
+                    logger.info().logf("downloading inc_snapshot from: {s}", .{inc_snapshot_url});
+                    _ = downloadFile(
+                        allocator,
+                        logger,
+                        inc_snapshot_url,
+                        output_dir,
+                        inc_snapshot_filename,
+                        // NOTE: no min limit (we already downloaded the full snapshot at a good speed so this should be ok)
+                        null,
+                    ) catch |err| {
+                        // failure here is ok (for now?)
+                        logger.warn().logf("failed to download inc_snapshot: {s}", .{@errorName(err)});
+                        //TODO better errrors
+                        continue;
+                    };
+                } else {
+                    logger.info().logf("ignoring peer as no incremental snapshots", .{});
+                }
+            }
+
+            // success
+            logger.info().logf("snapshot downloaded finished", .{});
+            return;
+        }
+    }
 }
 
 /// downloads full and incremental snapshots from peers found in gossip.
@@ -687,13 +774,23 @@ pub fn getOrDownloadAndUnpackSnapshot(
             return error.SnapshotsNotFoundAndNoGossipService;
         };
 
-        try downloadSnapshotsFromGossip(
+        //        try downloadSnapshotsFromGossip(
+        //            allocator,
+        //            logger.unscoped(),
+        //            options.trusted_validators,
+        //            gossip_service,
+        //            snapshot_dir,
+        //            @intCast(min_mb_per_sec),
+        //        );
+
+        try reliablyDownloadSnapshotsFromGossip(
             allocator,
             logger.unscoped(),
             options.trusted_validators,
             gossip_service,
             snapshot_dir,
             @intCast(min_mb_per_sec),
+            .All,
         );
     }
 
